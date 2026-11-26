@@ -17559,8 +17559,11 @@ async function collectTelemetry(requestedConvId, options = {}) {
       lastPlannerTimeMs = stepTimeMs;
       lastPlannerOutputTokens = outTok;
       const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
-      if (calls.length > 0) {
-        lastPlannerCalls = calls;
+      const nonBookkeepingCalls = calls.filter(
+        (c) => c.name !== "update_steps" && c.name !== "update_focus"
+      );
+      if (nonBookkeepingCalls.length > 0) {
+        lastPlannerCalls = nonBookkeepingCalls;
         genericResultsAfterLastPlanner = 0;
       }
       telemetry.mainLayer.toolCalls += calls.length;
@@ -17667,7 +17670,8 @@ async function collectTelemetry(requestedConvId, options = {}) {
             status: subInfo.status,
             progress: subInfo.progress,
             steps: subInfo.steps,
-            lastTool: subInfo.lastTool
+            lastTool: subInfo.lastTool,
+            lastActiveMs: subInfo.mtimeMs || stepTimeMs
           });
           if (isRecent || subInfo.status === "running") {
             telemetry.pulses.fanout_active = true;
@@ -17746,10 +17750,8 @@ async function collectTelemetry(requestedConvId, options = {}) {
     });
   }
   telemetry.mainLayer.totalTokens = telemetry.mainLayer.inputTokens + telemetry.mainLayer.cacheReadTokens + telemetry.mainLayer.outputTokens;
-  telemetry.mainLayer.subagents = Array.from(subagentMap.values()).slice(-3);
-  const visibleCalls = lastPlannerCalls.filter(
-    (c) => c.name !== "update_steps" && c.name !== "update_focus"
-  );
+  telemetry.mainLayer.subagents = Array.from(subagentMap.values()).filter((s) => s.status === "running" || now - (s.lastActiveMs || 0) < 6e4).slice(-3);
+  const visibleCalls = lastPlannerCalls;
   const inFlight = Math.max(
     0,
     lastPlannerCalls.length - genericResultsAfterLastPlanner
