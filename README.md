@@ -107,7 +107,7 @@ This bundles both `dist/server.mjs` (Node ESM) and `dist/app.html` (single-file 
 
 - **100% Local**: Runs strictly over local Stdio MCP. Never sends transcripts, prompts, or telemetry to any external server.
 - **No Auto-Updater**: Zero background downloads or silent code modifications.
-- **Read-Only**: Only reads local transcript files and optional localhost health endpoints.
+- **Read-Only**: Only reads local transcript files (bounded to a rolling 4 MiB / 500-step window for low memory & CPU overhead) and optional localhost health endpoints.
 
 ---
 
