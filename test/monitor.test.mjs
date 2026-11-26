@@ -209,6 +209,54 @@ test("collectTelemetry & inspectSubagentTranscript detect running subagents (>64
   }
 });
 
+test("collectTelemetry hides stale completed subagents (>60s) and preserves recentTools across update_steps turns", async () => {
+  clearTelemetryCaches();
+  const brain = makeTempBrain();
+  try {
+    const oldIso = new Date(Date.now() - 120_000).toISOString();
+    const nowIso = new Date().toISOString();
+    const subPath = writeTranscript(brain, "sub-old-1", [
+      JSON.stringify({ step_index: 0, type: "PLANNER_RESPONSE", created_at: oldIso, content: "done" }),
+    ]);
+    const oldDate = new Date(Date.now() - 120_000);
+    fs.utimesSync(subPath, oldDate, oldDate);
+
+    writeTranscript(brain, "conv-ttl", [
+      JSON.stringify({ step_index: 0, source: "USER_EXPLICIT", type: "USER_INPUT", created_at: oldIso, content: "<USER_REQUEST>ttl check</USER_REQUEST>" }),
+      JSON.stringify({
+        step_index: 1,
+        type: "PLANNER_RESPONSE",
+        created_at: oldIso,
+        model: "gemini-4-neon",
+        tool_calls: [{ name: "invoke_subagent", args: { Role: '"Old Inspector"', TypeName: '"browser"' } }],
+      }),
+      JSON.stringify({ step_index: 2, type: "GENERIC", created_at: oldIso, content: '{"conversationId": "sub-old-1"}' }),
+      JSON.stringify({
+        step_index: 3,
+        type: "PLANNER_RESPONSE",
+        created_at: nowIso,
+        model: "gemini-4-neon",
+        tool_calls: [{ name: "run_command", args: { toolSummary: '"Run tests"' } }],
+      }),
+      JSON.stringify({ step_index: 4, type: "GENERIC", created_at: nowIso, content: "ok" }),
+      JSON.stringify({
+        step_index: 5,
+        type: "PLANNER_RESPONSE",
+        created_at: nowIso,
+        model: "gemini-4-neon",
+        tool_calls: [{ name: "update_steps", args: {} }],
+      }),
+    ]);
+
+    const data = await collectTelemetry("conv-ttl", { brainDir: brain, skipLocalProbe: true });
+    assert.equal(data.mainLayer.subagents.length, 0, "stale completed subagent (>60s) must be hidden");
+    assert.equal(data.mainLayer.parallelMode, "tools");
+    assert.equal(data.mainLayer.recentTools[0].role, "run_command");
+  } finally {
+    fs.rmSync(brain, { recursive: true, force: true });
+  }
+});
+
 test("dist/app.html contains CSP meta tag, valid JS, and XSS-safe escaping & clampPct in src/app.ts", () => {
   const htmlPath = path.join(ROOT, "dist", "app.html");
   assert.ok(fs.existsSync(htmlPath), "dist/app.html must exist");

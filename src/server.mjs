@@ -605,8 +605,11 @@ export async function collectTelemetry(
       lastPlannerOutputTokens = outTok;
 
       const calls = Array.isArray(step.tool_calls) ? step.tool_calls : [];
-      if (calls.length > 0) {
-        lastPlannerCalls = calls;
+      const nonBookkeepingCalls = calls.filter(
+        (c) => c.name !== "update_steps" && c.name !== "update_focus"
+      );
+      if (nonBookkeepingCalls.length > 0) {
+        lastPlannerCalls = nonBookkeepingCalls;
         genericResultsAfterLastPlanner = 0;
       }
       telemetry.mainLayer.toolCalls += calls.length;
@@ -740,6 +743,7 @@ export async function collectTelemetry(
             progress: subInfo.progress,
             steps: subInfo.steps,
             lastTool: subInfo.lastTool,
+            lastActiveMs: subInfo.mtimeMs || stepTimeMs,
           });
 
           if (isRecent || subInfo.status === "running") {
@@ -838,11 +842,12 @@ export async function collectTelemetry(
     telemetry.mainLayer.inputTokens +
     telemetry.mainLayer.cacheReadTokens +
     telemetry.mainLayer.outputTokens;
-  telemetry.mainLayer.subagents = Array.from(subagentMap.values()).slice(-3);
+  // Show only currently running subagents or ones finished within the last 60s
+  telemetry.mainLayer.subagents = Array.from(subagentMap.values())
+    .filter((s) => s.status === "running" || now - (s.lastActiveMs || 0) < 60_000)
+    .slice(-3);
 
-  const visibleCalls = lastPlannerCalls.filter(
-    (c) => c.name !== "update_steps" && c.name !== "update_focus"
-  );
+  const visibleCalls = lastPlannerCalls;
   const inFlight = Math.max(
     0,
     lastPlannerCalls.length - genericResultsAfterLastPlanner
