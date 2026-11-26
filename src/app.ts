@@ -116,6 +116,12 @@ function escapeHtml(str: string): string {
     .replace(/"/g, "&quot;");
 }
 
+function clampPct(val: unknown): number {
+  const n = Number(val);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(100, Math.max(0, Math.round(n)));
+}
+
 function pulseHeartbeat(ok: boolean, msg: string) {
   const dot = el("hbDot");
   const sync = el("syncStatus");
@@ -382,13 +388,14 @@ function render(data: TelemetryData) {
           : s.status === "done"
             ? "✓ done"
             : "○ idle";
+      const pct = clampPct(s.progress);
       return `
         <div class="sub-card ${modeCls} ${cls}">
           <div class="sub-name" title="${escapeHtml(s.role)}">${escapeHtml(s.role)}</div>
           <div class="sub-type" title="${escapeHtml(s.type)}">${escapeHtml(s.type)}</div>
           <div class="sub-bar-wrap">
-            <div class="sub-track"><div class="sub-fill" style="width:${s.progress}%"></div></div>
-            <span class="sub-pct">${s.progress}%</span>
+            <div class="sub-track"><div class="sub-fill" style="width:${pct}%"></div></div>
+            <span class="sub-pct">${pct}%</span>
           </div>
           <div class="sub-status ${stCls}">${stLabel}</div>
         </div>
@@ -428,7 +435,7 @@ function render(data: TelemetryData) {
     tlBars.innerHTML = data.timeline
       .map(
         (t) =>
-          `<div class="tl-bar ${escapeHtml(t.layer)}" style="height:${t.height}%" title="${escapeHtml(t.label)}"></div>`
+          `<div class="tl-bar ${escapeHtml(t.layer)}" style="height:${clampPct(t.height)}%" title="${escapeHtml(t.label)}"></div>`
       )
       .join("");
   }

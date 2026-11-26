@@ -16,15 +16,28 @@ const __dirname = path.dirname(__filename);
 
 const APP_URI = "ui://agy-flow-monitor/app.html";
 const HTML_PATH = process.env.AGY_MONITOR_HTML || path.join(__dirname, "app.html");
-const BRAIN_DIR =
+const DEFAULT_BRAIN_DIR =
   process.env.AGY_BRAIN_DIR ||
   path.join(os.homedir(), ".gemini", "antigravity", "brain");
 const DISABLE_LOCAL_PROBE = process.env.AGY_MONITOR_NO_LOCAL_PROBE === "1";
+
+const MAX_INITIAL_READ_BYTES = 4 * 1024 * 1024; // 4 MiB cap on cold load
+const SUBAGENT_TAIL_BYTES = 64 * 1024; // 64 KiB tail cap for subagents
+const MAX_CACHED_STEPS = 500; // Rolling window cap for bounded RAM & CPU
+const MAX_CACHE_ENTRIES = 16;
+
+const transcriptCache = new Map();
+const subagentCache = new Map();
 
 let localLlmCache = {
   checkedAt: 0,
   state: { status: "standby", model: "unloaded", endpoint: "127.0.0.1" },
 };
+
+export function clearTelemetryCaches() {
+  transcriptCache.clear();
+  subagentCache.clear();
+}
 
 async function probeLocalLlm() {
   if (DISABLE_LOCAL_PROBE) {
@@ -95,7 +108,7 @@ function humanizeModel(raw) {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-function getContextLimit(rawModel) {
+export function getContextLimit(rawModel) {
   const m = String(rawModel || "").toLowerCase();
   if (!m) return 1_000_000;
   if (m.includes("claude") && !m.includes("1m")) return 200_000;
@@ -116,28 +129,166 @@ function unquoteArg(val) {
   return val;
 }
 
-function readFirstLine(filePath) {
+function readRangeSync(filePath, startOffset, byteLength) {
+  if (byteLength <= 0) return "";
+  let fd;
   try {
-    const fd = fs.openSync(filePath, "r");
+    fd = fs.openSync(filePath, "r");
+    const buf = Buffer.alloc(byteLength);
+    const bytes = fs.readSync(fd, buf, 0, byteLength, startOffset);
+    return buf.subarray(0, bytes).toString("utf8");
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore close error
+      }
+    }
+  }
+}
+
+export function readFirstLine(filePath) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, "r");
     const buf = Buffer.alloc(4096);
     const bytes = fs.readSync(fd, buf, 0, 4096, 0);
-    fs.closeSync(fd);
-    const text = buf.slice(0, bytes).toString("utf8");
+    const text = buf.subarray(0, bytes).toString("utf8");
     const nl = text.indexOf("\n");
     return nl >= 0 ? text.slice(0, nl) : text;
   } catch {
     return "";
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore close error
+      }
+    }
   }
 }
 
-function listConversations() {
-  if (!fs.existsSync(BRAIN_DIR)) return [];
-  const entries = fs.readdirSync(BRAIN_DIR, { withFileTypes: true });
+export function readTranscriptIncremental(filePath) {
+  let stat;
+  try {
+    stat = fs.statSync(filePath);
+  } catch {
+    return { steps: [], cacheHit: false };
+  }
+
+  const cached = transcriptCache.get(filePath);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    return { steps: cached.steps, cacheHit: true };
+  }
+
+  // Incremental append path: always read from cached.offset (start of any incomplete trailing line)
+  if (cached && stat.size > cached.size && cached.offset <= stat.size) {
+    const deltaBytes = stat.size - cached.offset;
+    if (deltaBytes <= MAX_INITIAL_READ_BYTES) {
+      try {
+        const chunk = readRangeSync(filePath, cached.offset, deltaBytes);
+        const parts = chunk.split("\n");
+        const trailing = parts.pop() || "";
+        for (const line of parts) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            cached.steps.push(JSON.parse(trimmed));
+          } catch {
+            // skip malformed line
+          }
+        }
+        let trailingBytes = Buffer.byteLength(trailing, "utf8");
+        if (trailing.trim()) {
+          try {
+            cached.steps.push(JSON.parse(trailing.trim()));
+            trailingBytes = 0;
+          } catch {
+            // incomplete trailing line: keep cached.offset at start of trailing
+          }
+        } else {
+          trailingBytes = 0;
+        }
+        if (cached.steps.length > MAX_CACHED_STEPS) {
+          cached.steps = cached.steps.slice(-MAX_CACHED_STEPS);
+        }
+        cached.mtimeMs = stat.mtimeMs;
+        cached.size = stat.size;
+        cached.offset = stat.size - trailingBytes;
+        return { steps: cached.steps, cacheHit: false };
+      } catch {
+        // fall through to cold read
+      }
+    }
+  }
+
+  // Cold read (bounded to last MAX_INITIAL_READ_BYTES and MAX_CACHED_STEPS)
+  try {
+    const startOffset = Math.max(0, stat.size - MAX_INITIAL_READ_BYTES);
+    const toRead = stat.size - startOffset;
+    const raw = readRangeSync(filePath, startOffset, toRead);
+    const parts = raw.split("\n");
+    if (startOffset > 0) {
+      parts.shift();
+    }
+    const trailing = parts.pop() || "";
+    const steps = [];
+    for (const line of parts) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        steps.push(JSON.parse(trimmed));
+      } catch {
+        // skip malformed line
+      }
+    }
+    let trailingBytes = Buffer.byteLength(trailing, "utf8");
+    if (trailing.trim()) {
+      try {
+        steps.push(JSON.parse(trailing.trim()));
+        trailingBytes = 0;
+      } catch {
+        // incomplete trailing line
+      }
+    } else {
+      trailingBytes = 0;
+    }
+
+    const boundedSteps =
+      steps.length > MAX_CACHED_STEPS ? steps.slice(-MAX_CACHED_STEPS) : steps;
+
+    if (transcriptCache.size >= MAX_CACHE_ENTRIES) {
+      const oldestKey = transcriptCache.keys().next().value;
+      if (oldestKey) transcriptCache.delete(oldestKey);
+    }
+    transcriptCache.set(filePath, {
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      offset: stat.size - trailingBytes,
+      steps: boundedSteps,
+    });
+    return { steps: boundedSteps, cacheHit: false };
+  } catch {
+    return { steps: [], cacheHit: false };
+  }
+}
+
+export function listConversations(brainDir = DEFAULT_BRAIN_DIR) {
+  let entries;
+  try {
+    if (!fs.existsSync(brainDir)) return [];
+    entries = fs.readdirSync(brainDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
   const list = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const tPath = path.join(
-      BRAIN_DIR,
+      brainDir,
       entry.name,
       ".system_generated",
       "logs",
@@ -184,58 +335,97 @@ function listConversations() {
   return list;
 }
 
-function inspectSubagentTranscript(convId) {
+export function inspectSubagentTranscript(convId, brainDir = DEFAULT_BRAIN_DIR) {
   const tPath = path.join(
-    BRAIN_DIR,
+    brainDir,
     convId,
     ".system_generated",
     "logs",
     "transcript.jsonl"
   );
-  if (!fs.existsSync(tPath)) {
-    return { status: "done", progress: 100, steps: 0, lastTool: "" };
-  }
+  let stat;
   try {
-    const stat = fs.statSync(tPath);
-    const raw = fs.readFileSync(tPath, "utf8");
-    const lines = raw.trim().split("\n").filter(Boolean);
-    let lastTool = "";
-    let lastType = "";
-    let lastHasTools = false;
-    for (const line of lines.slice(-15)) {
-      try {
-        const obj = JSON.parse(line);
-        lastType = obj.type || "";
-        if (Array.isArray(obj.tool_calls) && obj.tool_calls.length > 0) {
-          lastTool = obj.tool_calls[obj.tool_calls.length - 1].name || lastTool;
-          lastHasTools = true;
-        } else if (obj.type === "PLANNER_RESPONSE") {
-          lastHasTools = false;
-        }
-      } catch {
-        // ignore
-      }
-    }
-    const ageMs = Date.now() - stat.mtimeMs;
-    const isRunning =
-      ageMs < 15000 && (lastHasTools || lastType !== "PLANNER_RESPONSE");
-    return {
-      status: isRunning ? "running" : "done",
-      progress: isRunning ? Math.min(92, 18 + lines.length * 7) : 100,
-      steps: lines.length,
-      lastTool,
-      mtimeMs: stat.mtimeMs,
-    };
+    stat = fs.statSync(tPath);
   } catch {
     return { status: "done", progress: 100, steps: 0, lastTool: "" };
   }
+
+  const cached = subagentCache.get(tPath);
+  let meta;
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    meta = cached;
+  } else {
+    try {
+      const startOffset = Math.max(0, stat.size - SUBAGENT_TAIL_BYTES);
+      const raw = readRangeSync(tPath, startOffset, stat.size - startOffset);
+      const lines = raw.split("\n").filter((l) => l.trim().length > 0);
+      if (startOffset > 0 && lines.length > 0) lines.shift();
+
+      let lastTool = "";
+      let lastType = "";
+      let lastHasTools = false;
+      let stepCount = lines.length;
+      for (const line of lines.slice(-15)) {
+        try {
+          const obj = JSON.parse(line);
+          lastType = obj.type || "";
+          if (typeof obj.step_index === "number") {
+            stepCount = Math.max(stepCount, obj.step_index + 1);
+          }
+          if (Array.isArray(obj.tool_calls) && obj.tool_calls.length > 0) {
+            lastTool =
+              obj.tool_calls[obj.tool_calls.length - 1].name || lastTool;
+            lastHasTools = true;
+          } else if (obj.type === "PLANNER_RESPONSE") {
+            lastHasTools = false;
+          }
+        } catch {
+          // ignore
+        }
+      }
+      meta = {
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        lastTool,
+        lastType,
+        lastHasTools,
+        stepCount,
+      };
+      if (subagentCache.size >= MAX_CACHE_ENTRIES * 2) {
+        const oldestKey = subagentCache.keys().next().value;
+        if (oldestKey) subagentCache.delete(oldestKey);
+      }
+      subagentCache.set(tPath, meta);
+    } catch {
+      return { status: "done", progress: 100, steps: 0, lastTool: "" };
+    }
+  }
+
+  const ageMs = Date.now() - meta.mtimeMs;
+  const isRunning =
+    ageMs < 15000 &&
+    (meta.lastHasTools || meta.lastType !== "PLANNER_RESPONSE");
+  return {
+    status: isRunning ? "running" : "done",
+    progress: isRunning ? Math.min(92, 18 + meta.stepCount * 7) : 100,
+    steps: meta.stepCount,
+    lastTool: meta.lastTool,
+    mtimeMs: meta.mtimeMs,
+  };
 }
 
-async function collectTelemetry(requestedConvId) {
+export async function collectTelemetry(
+  requestedConvId,
+  options = {}
+) {
+  const brainDir = options.brainDir || DEFAULT_BRAIN_DIR;
+  const skipLocalProbe = options.skipLocalProbe ?? DISABLE_LOCAL_PROBE;
   const now = Date.now();
   const [localLlm, allConvs] = await Promise.all([
-    probeLocalLlm(),
-    Promise.resolve(listConversations()),
+    skipLocalProbe
+      ? Promise.resolve({ status: "disabled", model: "probe off", endpoint: "local" })
+      : probeLocalLlm(),
+    Promise.resolve(listConversations(brainDir)),
   ]);
   const mainConvs = allConvs.filter((c) => c.isMain);
   const candidates = mainConvs.length > 0 ? mainConvs : allConvs;
@@ -270,7 +460,7 @@ async function collectTelemetry(requestedConvId) {
     },
     layer0: localLlm,
     mcpLayer: {
-      mode: "generic", // "generic" | "jev"
+      mode: "generic",
       totalCalls: 0,
       status: "standby",
       meters: [
@@ -315,23 +505,7 @@ async function collectTelemetry(requestedConvId) {
 
   if (!target) return telemetry;
 
-  let lines = [];
-  try {
-    const raw = fs.readFileSync(target.path, "utf8");
-    lines = raw.trim().split("\n").filter(Boolean);
-  } catch {
-    return telemetry;
-  }
-
-  const parsedSteps = [];
-  for (const line of lines) {
-    try {
-      parsedSteps.push(JSON.parse(line));
-    } catch {
-      // skip malformed line
-    }
-  }
-
+  const { steps: parsedSteps } = readTranscriptIncremental(target.path);
   telemetry.mainLayer.steps = parsedSteps.length;
   const subagentMap = new Map();
   const genericMcpCounts = new Map();
@@ -449,7 +623,6 @@ async function collectTelemetry(requestedConvId) {
         const resolvedServer =
           serverName || (isMcpDirect ? name.split("_")[1] || "mcp" : "");
 
-        // Specialist: TypeSafe AI (JEV)
         if (
           resolvedServer === "typesafe-ai" ||
           String(toolName).startsWith("typesafe_")
@@ -494,9 +667,7 @@ async function collectTelemetry(requestedConvId) {
             meta: `p=${score.toFixed(2)} ${mode}`,
             tone: mode,
           });
-        }
-        // Advisor / Audit MCP
-        else if (
+        } else if (
           resolvedServer.includes("audit") ||
           String(toolName).includes("audit")
         ) {
@@ -526,9 +697,7 @@ async function collectTelemetry(requestedConvId) {
             meta: `call #${telemetry.advisorLayer.calls}`,
             tone: "info",
           });
-        }
-        // Any other MCP server call
-        else if (name === "call_mcp_tool" || isMcpDirect) {
+        } else if (name === "call_mcp_tool" || isMcpDirect) {
           stepLayer = "mcp";
           const srvKey = (resolvedServer || "mcp").slice(0, 14);
           genericMcpCounts.set(srvKey, (genericMcpCounts.get(srvKey) || 0) + 1);
@@ -545,24 +714,22 @@ async function collectTelemetry(requestedConvId) {
             meta: "mcp",
             tone: "sharp",
           });
-        }
-        // Subagents
-        else if (name === "invoke_subagent") {
+        } else if (name === "invoke_subagent") {
           stepLayer = "swarm";
           const role = unquoteArg(args.Role || "Subagent");
           const typeName = unquoteArg(args.TypeName || "agent");
           const model = unquoteArg(args.Model || "inherit");
           const nextStep = parsedSteps[i + 1];
-          let subConvId = `sub-${i}`;
+          let subConvId = `__fallback_sub__-${i}`;
           if (typeof nextStep?.content === "string") {
             const idMatch = nextStep.content.match(
               /"conversationId"\s*:\s*"([^"]+)"/
             );
             if (idMatch) subConvId = idMatch[1];
           }
-          const subInfo = subConvId.startsWith("sub-")
+          const subInfo = subConvId.startsWith("__fallback_sub__-")
             ? { status: "done", progress: 100, steps: 1, lastTool: "" }
-            : inspectSubagentTranscript(subConvId);
+            : inspectSubagentTranscript(subConvId, brainDir);
 
           subagentMap.set(subConvId, {
             id: subConvId,
@@ -587,9 +754,7 @@ async function collectTelemetry(requestedConvId) {
             meta: subInfo.status === "running" ? `${subInfo.progress}%` : "done",
             tone: "info",
           });
-        }
-        // Built-in tools
-        else if (name !== "update_steps" && name !== "update_focus") {
+        } else if (name !== "update_steps" && name !== "update_focus") {
           const summary = unquoteArg(
             args.toolSummary || args.Path || args.query || args.domain || ""
           ).toString();
@@ -639,7 +804,6 @@ async function collectTelemetry(requestedConvId) {
     }
   }
 
-  // Finalize MCP layer mode: JEV if detected, otherwise generic top-3 MCP servers
   if (jevCount > 0) {
     telemetry.mcpLayer.mode = "jev";
     telemetry.mcpLayer.meters = jevMeters;
@@ -759,49 +923,28 @@ async function collectTelemetry(requestedConvId) {
   return telemetry;
 }
 
-const server = new Server(
-  {
-    name: "agy-flow-monitor",
-    version: "1.0.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-      resources: {},
-    },
-  }
-);
-
-server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-  resources: [
+export function createMonitorServer() {
+  const server = new Server(
     {
-      uri: APP_URI,
-      name: "AGY Flow Monitor UI",
-      description:
-        "Real-time terminal-style telemetry and execution flow dashboard for Google Antigravity",
-      mimeType: "text/html;profile=mcp-app",
-      _meta: {
-        ui: {
-          prefersBorder: false,
-        },
-      },
+      name: "agy-flow-monitor",
+      version: "1.0.0",
     },
-  ],
-}));
+    {
+      capabilities: {
+        tools: {},
+        resources: {},
+      },
+    }
+  );
 
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-  if (request.params.uri !== APP_URI) {
-    throw new Error(`Unknown resource: ${request.params.uri}`);
-  }
-  const html = fs.existsSync(HTML_PATH)
-    ? fs.readFileSync(HTML_PATH, "utf8")
-    : "<html><body><pre>App not built yet. Run npm run build.</pre></body></html>";
-  return {
-    contents: [
+  server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+    resources: [
       {
         uri: APP_URI,
+        name: "AGY Flow Monitor UI",
+        description:
+          "Real-time terminal-style telemetry and execution flow dashboard for Google Antigravity",
         mimeType: "text/html;profile=mcp-app",
-        text: html,
         _meta: {
           ui: {
             prefersBorder: false,
@@ -809,75 +952,107 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
         },
       },
     ],
-  };
-});
+  }));
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: "open_monitor",
-      title: "AGY Flow Monitor",
-      description:
-        "Open the real-time execution flow and telemetry dashboard in the Antigravity side pane.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          conversationId: {
-            type: "string",
-            description:
-              "Optional conversation ID to inspect. Defaults to the latest active conversation.",
-          },
-        },
-      },
-      _meta: {
-        ui: {
-          resourceUri: APP_URI,
-        },
-        "com.google.antigravity/ui": {
-          entrypoints: [
-            { type: "aux_pane", title: "AGY Flow Monitor" },
-            { type: "global", title: "AGY Flow Monitor" },
-          ],
-        },
-      },
-    },
-    {
-      name: "poll_telemetry",
-      title: "Poll Telemetry",
-      description:
-        "App-only tool returning the latest real-time telemetry snapshot.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          conversationId: {
-            type: "string",
-            description: "Conversation ID or 'auto'",
-          },
-        },
-      },
-      _meta: {
-        ui: {
-          visibility: ["app"],
-        },
-      },
-    },
-  ],
-}));
-
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-  if (name === "open_monitor" || name === "poll_telemetry") {
-    const convId =
-      typeof args?.conversationId === "string" ? args.conversationId : "auto";
-    const data = await collectTelemetry(convId);
-    const summaryText = `AGY Flow Monitor | Session: ${data.conversationId ? data.conversationId.slice(0, 8) : "none"} | CTX: ${data.metrics.contextPct}% | Cache: ${data.metrics.cacheHitPct}% | TPS: ${data.metrics.tps} | Model: ${data.mainLayer.model} (${data.mainLayer.status})`;
+  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    if (request.params.uri !== APP_URI) {
+      throw new Error(`Unknown resource: ${request.params.uri}`);
+    }
+    const html = fs.existsSync(HTML_PATH)
+      ? fs.readFileSync(HTML_PATH, "utf8")
+      : "<html><body><pre>App not built yet. Run npm run build.</pre></body></html>";
     return {
-      content: [{ type: "text", text: summaryText }],
-      structuredContent: data,
+      contents: [
+        {
+          uri: APP_URI,
+          mimeType: "text/html;profile=mcp-app",
+          text: html,
+          _meta: {
+            ui: {
+              prefersBorder: false,
+            },
+          },
+        },
+      ],
     };
-  }
-  throw new Error(`Unknown tool: ${name}`);
-});
+  });
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name: "open_monitor",
+        title: "AGY Flow Monitor",
+        description:
+          "Open the real-time execution flow and telemetry dashboard in the Antigravity side pane.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            conversationId: {
+              type: "string",
+              description:
+                "Optional conversation ID to inspect. Defaults to the latest active conversation.",
+            },
+          },
+        },
+        _meta: {
+          ui: {
+            resourceUri: APP_URI,
+          },
+          "com.google.antigravity/ui": {
+            entrypoints: [
+              { type: "aux_pane", title: "AGY Flow Monitor" },
+              { type: "global", title: "AGY Flow Monitor" },
+            ],
+          },
+        },
+      },
+      {
+        name: "poll_telemetry",
+        title: "Poll Telemetry",
+        description:
+          "App-only tool returning the latest real-time telemetry snapshot.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            conversationId: {
+              type: "string",
+              description: "Conversation ID or 'auto'",
+            },
+          },
+        },
+        _meta: {
+          ui: {
+            visibility: ["app"],
+          },
+        },
+      },
+    ],
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    if (name === "open_monitor" || name === "poll_telemetry") {
+      const convId =
+        typeof args?.conversationId === "string" ? args.conversationId : "auto";
+      const data = await collectTelemetry(convId);
+      const summaryText = `AGY Flow Monitor | Session: ${data.conversationId ? data.conversationId.slice(0, 8) : "none"} | CTX: ${data.metrics.contextPct}% | Cache: ${data.metrics.cacheHitPct}% | TPS: ${data.metrics.tps} | Model: ${data.mainLayer.model} (${data.mainLayer.status})`;
+      return {
+        content: [{ type: "text", text: summaryText }],
+        structuredContent: data,
+      };
+    }
+    throw new Error(`Unknown tool: ${name}`);
+  });
+
+  return server;
+}
+
+const isMainEntry =
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === path.resolve(__filename);
+
+if (isMainEntry) {
+  const server = createMonitorServer();
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
