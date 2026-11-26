@@ -1,0 +1,17 @@
+{
+  "name": "agy-flow-monitor",
+  "displayName": "AGY Flow Monitor",
+  "version": "1.0.0",
+  "description": "Zero-dependency real-time flow & telemetry side-pane dashboard for Google Antigravity. Visualizes context window, cache hit rate, TPS, parallel tool execution, subagent swarms, MCP routing, and local LLM status.",
+  "license": "MIT",
+  "repository": "https://github.com/qryuu/agy-flow-monitor",
+  "keywords": [
+    "antigravity",
+    "mcp-app",
+    "telemetry",
+    "monitor",
+    "dashboard",
+    "subagents",
+    "visualization"
+  ]
+}

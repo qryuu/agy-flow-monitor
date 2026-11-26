@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AGY Flow Monitor</title>
+  <style>
+    :root {
+      --bg: #0b0f14;
+      --surface: #0f141b;
+      --card: #121923;
+      --border: #243041;
+      --text: #dce6f2;
+      --muted: #6e7f96;
+      --dim: #46556a;
+      --orange: #f28b50;
+      --blue: #58a6ff;
+      --green: #3dd68c;
+      --purple: #b392f0;
+      --cyan: #39c5cf;
+      --yellow: #e3b341;
+      --red: #f85149;
+      --mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 11px;
+      line-height: 1.4;
+      overflow-x: hidden;
+      overflow-y: auto;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .terminal {
+      min-height: 100%;
+      background: var(--surface);
+      display: flex;
+      flex-direction: column;
+      border: 1px solid #1e2836;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    /* Title Bar */
+    .titlebar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      padding: 6px 10px;
+      background: #0d1218;
+      border-bottom: 1px solid #1c2533;
+      user-select: none;
+    }
+
+    .win-title {
+      color: var(--muted);
+      font-size: 9.5px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .hb-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--muted);
+      display: inline-block;
+      flex-shrink: 0;
+      transition: transform 0.2s ease, background-color 0.2s ease;
+    }
+    .hb-dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .hb-dot.pulse { transform: scale(1.45); }
+    .hb-dot.err { background: var(--red); box-shadow: 0 0 6px var(--red); }
+
+    .controls { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
+    .mode-btn {
+      font-family: var(--mono);
+      font-size: 9px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: #141c26;
+      color: var(--muted);
+      cursor: pointer;
+    }
+    .mode-btn:hover { border-color: var(--text); color: var(--text); }
+    .mode-btn.live-active { border-color: rgba(61, 214, 140, 0.55); color: var(--green); background: rgba(61, 214, 140, 0.14); }
+    .mode-btn.demo-active { border-color: rgba(179, 146, 240, 0.65); color: var(--purple); background: rgba(179, 146, 240, 0.15); }
+    .session-select {
+      font-family: var(--mono);
+      font-size: 9px;
+      max-width: 108px;
+      padding: 2px 4px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: #141c26;
+      color: var(--text);
+      outline: none;
+    }
+
+    /* Banner & Metrics Strip */
+    .banner {
+      text-align: center;
+      padding: 6px 10px 4px;
+      border-bottom: 1px solid #1a2330;
+      font-size: 9.5px;
+      letter-spacing: 0.05em;
+      font-weight: 600;
+    }
+    .banner .t-muted { color: var(--muted); }
+    .banner .t-orange { color: var(--orange); }
+    .banner .t-blue { color: var(--blue); }
+
+    .metrics-strip {
+      display: grid;
+      grid-template-columns: 1.45fr 0.75fr 0.75fr 0.65fr;
+      gap: 6px;
+      padding: 6px 10px;
+      background: #0c1118;
+      border-bottom: 1px solid #18202c;
+      font-size: 9px;
+      font-variant-numeric: tabular-nums;
+    }
+    .metric-cell {
+      background: #111822;
+      border: 1px solid #1d2837;
+      border-radius: 4px;
+      padding: 4px 6px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      min-width: 0;
+    }
+    .metric-top { display: flex; justify-content: space-between; color: var(--muted); font-size: 8.5px; }
+    .metric-val { color: var(--text); font-weight: 700; font-size: 10px; margin-top: 1px; }
+    .ctx-track { height: 4px; background: #1c2736; border-radius: 2px; margin-top: 3px; overflow: hidden; }
+    .ctx-fill { height: 100%; width: 0%; background: var(--green); transition: width 0.35s ease, background-color 0.25s ease; }
+
+    /* Main Grid */
+    .stage {
+      display: grid;
+      grid-template-columns: minmax(114px, 30%) 1fr;
+      gap: 9px;
+      padding: 9px 10px 6px;
+      flex: 1;
+    }
+    .stage.rail-hidden {
+      grid-template-columns: 1fr;
+    }
+    .stage.rail-hidden .left-rail {
+      display: none;
+    }
+
+    .left-rail { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+
+    .advisor-box {
+      flex: 1;
+      border: 1px solid rgba(179, 146, 240, 0.42);
+      border-radius: 5px;
+      background: linear-gradient(180deg, rgba(179, 146, 240, 0.06), rgba(18, 25, 35, 0.85));
+      padding: 7px 6px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      transition: box-shadow 0.25s ease, border-color 0.25s ease;
+    }
+    .advisor-box.advising { border-color: var(--purple); box-shadow: 0 0 14px rgba(179, 146, 240, 0.28); }
+
+    .box-head { text-align: center; margin-bottom: 5px; }
+    .box-title { font-size: 10px; font-weight: 700; letter-spacing: 0.03em; }
+    .box-sub { font-size: 8.5px; color: var(--muted); }
+
+    .triggers { display: flex; flex-direction: column; gap: 4px; margin: 3px 0 6px; }
+    .trigger-item { font-size: 9px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
+    .trigger-item.active { color: var(--purple); font-weight: 600; }
+
+    .advice-block { border-top: 1px dashed #293548; border-bottom: 1px dashed #293548; padding: 5px 0; margin: 3px 0; }
+    .advice-label { font-size: 8.5px; color: var(--muted); margin-bottom: 2px; }
+    .advice-text { font-size: 9px; color: var(--text); word-break: break-word; min-height: 24px; }
+
+    .kv-list { display: flex; flex-direction: column; gap: 2px; margin-top: 3px; font-size: 9px; }
+    .kv-row { display: flex; justify-content: space-between; color: var(--muted); }
+    .kv-val { color: var(--text); font-weight: 600; }
+
+    .l0-box {
+      border: 1px solid rgba(57, 197, 207, 0.4);
+      border-radius: 5px;
+      background: rgba(57, 197, 207, 0.05);
+      padding: 5px 6px;
+    }
+    .l0-box.active { border-color: var(--cyan); box-shadow: 0 0 12px rgba(57, 197, 207, 0.25); }
+    .l0-head { display: flex; justify-content: space-between; align-items: center; font-size: 9px; font-weight: 700; color: var(--cyan); }
+    .l0-meta { font-size: 8.5px; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* Right Column: Execution Flow */
+    .flow-col { display: flex; flex-direction: column; align-items: center; min-width: 0; }
+    .node {
+      width: 100%;
+      border-radius: 5px;
+      padding: 6px 8px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      transition: box-shadow 0.25s ease, border-color 0.25s ease;
+    }
+    .node-main { border-color: rgba(242, 139, 80, 0.55); background: linear-gradient(180deg, rgba(242, 139, 80, 0.08), var(--card)); }
+    .node-main.pulsing { border-color: var(--orange); box-shadow: 0 0 14px rgba(242, 139, 80, 0.25); }
+    .node-mcp { border-color: rgba(61, 214, 140, 0.48); background: linear-gradient(180deg, rgba(61, 214, 140, 0.07), var(--card)); }
+    .node-mcp.pulsing { border-color: var(--green); box-shadow: 0 0 14px rgba(61, 214, 140, 0.25); }
+
+    .node-row { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+    .main-sub { display: flex; justify-content: space-between; align-items: center; margin-top: 2px; font-size: 9px; color: var(--muted); }
+
+    /* MCP / Routing Meters */
+    .mcp-meters { margin-top: 4px; display: flex; flex-direction: column; gap: 3px; }
+    .meter-row { display: grid; grid-template-columns: 72px 1fr 62px; align-items: center; gap: 5px; font-size: 9px; }
+    .meter-label { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .meter-track { height: 7px; background: #1b2533; border-radius: 2px; overflow: hidden; }
+    .meter-fill { height: 100%; width: 0%; border-radius: 2px; transition: width 0.35s ease, background-color 0.25s ease; }
+    .meter-fill.sharp { background: var(--green); }
+    .meter-fill.split { background: var(--orange); }
+    .meter-fill.idle { background: #334357; }
+    .meter-val { text-align: right; font-size: 8.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .meter-val.sharp { color: var(--green); }
+    .meter-val.split { color: var(--orange); }
+    .meter-val.idle { color: var(--muted); }
+
+    .connector-svg { width: 100%; display: block; overflow: visible; }
+
+    /* Parallel Fan-out Cards */
+    .swarm-grid { width: 100%; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; }
+    .sub-card {
+      border: 1px solid rgba(88, 166, 255, 0.42);
+      border-radius: 5px;
+      background: linear-gradient(180deg, rgba(88, 166, 255, 0.08), var(--card));
+      padding: 5px 5px 4px;
+      text-align: center;
+      min-width: 0;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+    .sub-card.running { border-color: var(--blue); box-shadow: 0 0 12px rgba(88, 166, 255, 0.28); }
+    .sub-card.tool-card { border-color: rgba(242, 139, 80, 0.42); background: linear-gradient(180deg, rgba(242, 139, 80, 0.07), var(--card)); }
+    .sub-card.tool-card.running { border-color: var(--orange); box-shadow: 0 0 12px rgba(242, 139, 80, 0.28); }
+    .sub-card.idle { border-color: #223042; opacity: 0.6; }
+    .sub-name { font-size: 9.5px; font-weight: 700; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sub-type { font-size: 8px; color: var(--blue); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sub-card.tool-card .sub-type { color: var(--orange); }
+    .sub-bar-wrap { display: flex; align-items: center; gap: 3px; margin: 3px 0 2px; }
+    .sub-track { flex: 1; height: 5px; background: #1b2533; border-radius: 2px; overflow: hidden; }
+    .sub-fill { height: 100%; background: var(--blue); transition: width 0.35s ease; }
+    .sub-card.tool-card .sub-fill { background: var(--orange); }
+    .sub-pct { font-size: 8px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .sub-status { font-size: 8px; color: var(--muted); }
+    .sub-status.running { color: var(--blue); }
+    .sub-card.tool-card .sub-status.running { color: var(--orange); }
+    .sub-status.done { color: var(--green); }
+
+    .node-return { text-align: center; padding: 5px 8px; }
+
+    /* Activity Timeline Sparkline */
+    .timeline-panel { margin: 0 10px 6px; border: 1px solid #1c2635; border-radius: 5px; background: #0c1118; padding: 5px 8px; }
+    .timeline-head { display: flex; justify-content: space-between; font-size: 8.5px; color: var(--muted); margin-bottom: 4px; }
+    .timeline-bars { display: flex; align-items: flex-end; gap: 3px; height: 22px; }
+    .tl-bar { flex: 1; min-width: 4px; border-radius: 1.5px 1.5px 0 0; transition: height 0.25s ease; }
+    .tl-bar.main { background: var(--orange); }
+    .tl-bar.swarm { background: var(--blue); }
+    .tl-bar.mcp { background: var(--green); }
+    .tl-bar.advisor { background: var(--purple); }
+    .tl-bar.user { background: #8b9bb4; }
+
+    /* Session Log Panel */
+    .log-panel { margin: 0 10px 7px; border: 1px solid #1f2a39; border-radius: 5px; background: #0b1016; padding: 5px 8px; }
+    .log-header { font-size: 8.5px; color: var(--muted); margin-bottom: 3px; display: flex; justify-content: space-between; }
+    .log-list { display: flex; flex-direction: column; gap: 2px; max-height: 92px; overflow-y: auto; font-size: 9px; font-variant-numeric: tabular-nums; }
+    .log-row { display: grid; grid-template-columns: 48px 54px 1fr auto; gap: 5px; align-items: baseline; }
+    .log-time { color: var(--dim); }
+    .log-actor { font-weight: 600; }
+    .log-actor.main { color: var(--orange); }
+    .log-actor.mcp { color: var(--green); }
+    .log-actor.subagent { color: var(--blue); }
+    .log-actor.advisor { color: var(--purple); }
+    .log-actor.local { color: var(--cyan); }
+    .log-actor.user { color: var(--text); }
+    .log-detail { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .log-meta { color: var(--muted); font-size: 8.5px; white-space: nowrap; }
+    .log-meta.sharp { color: var(--green); }
+    .log-meta.split { color: var(--orange); }
+
+    /* Footer */
+    .footer { padding: 5px 10px 7px; border-top: 1px solid #1a2330; background: #0c1117; }
+    .prompt-line { font-size: 9.5px; color: var(--text); display: flex; align-items: center; gap: 5px; margin-bottom: 3px; }
+    .prompt-path { color: var(--green); }
+    .cursor { display: inline-block; width: 6px; height: 10px; background: var(--green); animation: blink 1s step-end infinite; }
+    @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
+
+    .statusbar { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 10px; font-size: 9px; color: var(--muted); }
+    .sb-left { display: flex; flex-wrap: wrap; gap: 4px 10px; }
+    .badge-orange { color: var(--orange); }
+    .badge-blue { color: var(--blue); }
+    .badge-green { color: var(--green); }
+    .badge-purple { color: var(--purple); }
+    .badge-cyan { color: var(--cyan); }
+    .sync-status { font-size: 8.5px; color: var(--dim); }
+    .sync-status.err { color: var(--red); }
+
+    .packet { opacity: 0; transition: opacity 0.25s ease; }
+    .packet.active { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div class="terminal">
+    <div class="titlebar">
+      <div class="win-title">
+        <span class="hb-dot" id="hbDot"></span>
+        <span id="winTitle">~/antigravity · flow · live</span>
+      </div>
+      <div class="controls">
+        <select class="session-select" id="sessionSelect" title="Select conversation">
+          <option value="auto">auto (latest)</option>
+        </select>
+        <button class="mode-btn" id="railBtn" type="button" title="Toggle Advisor/Local Rail">RAIL</button>
+        <button class="mode-btn live-active" id="modeBtn" type="button">LIVE</button>
+      </div>
+    </div>
+
+    <div class="banner">
+      <span class="t-muted">ANTIGRAVITY FLOW</span>
+      <span class="t-muted"> · </span>
+      <span class="t-orange">MAIN AGENT</span>
+      <span class="t-muted"> · </span>
+      <span class="t-blue">PARALLEL SWARM</span>
+    </div>
+
+    <div class="metrics-strip">
+      <div class="metric-cell">
+        <div class="metric-top"><span>CONTEXT</span><span id="ctxPct">0%</span></div>
+        <div class="metric-val" id="ctxVal">0k / 1M</div>
+        <div class="ctx-track"><div class="ctx-fill" id="ctxFill"></div></div>
+      </div>
+      <div class="metric-cell">
+        <div class="metric-top"><span>CACHE</span></div>
+        <div class="metric-val" style="color:var(--green)" id="cacheVal">0%</div>
+      </div>
+      <div class="metric-cell">
+        <div class="metric-top"><span>SPEED</span></div>
+        <div class="metric-val" style="color:var(--cyan)" id="tpsVal">-- t/s</div>
+      </div>
+      <div class="metric-cell">
+        <div class="metric-top"><span>LATENCY</span></div>
+        <div class="metric-val" id="latVal">--s</div>
+      </div>
+    </div>
+
+    <div class="stage" id="stage">
+      <!-- Left Rail: Advisor / Audit + Local LLM -->
+      <div class="left-rail">
+        <div class="advisor-box" id="advisorBox">
+          <div>
+            <div class="box-head">
+              <div class="box-title" style="color:var(--purple)">ADVISOR / AUDIT</div>
+              <div class="box-sub" id="advisorStatus">on call</div>
+            </div>
+            <div class="triggers" id="advisorTriggers">
+              <div class="trigger-item" data-idx="0"><span>◇</span><span>before a plan</span></div>
+              <div class="trigger-item" data-idx="1"><span>◇</span><span>same error x2</span></div>
+              <div class="trigger-item" data-idx="2"><span>◇</span><span>before done</span></div>
+            </div>
+            <div class="advice-block">
+              <div class="advice-label">last review:</div>
+              <div class="advice-text" id="advisorAdvice">» silent on routine turns</div>
+            </div>
+          </div>
+          <div class="kv-list">
+            <div class="kv-row"><span>calls</span><span class="kv-val" id="advisorCalls">0</span></div>
+            <div class="kv-row"><span>ctx read</span><span class="kv-val" id="advisorTokens">0k</span></div>
+          </div>
+        </div>
+
+        <div class="l0-box" id="l0Box">
+          <div class="l0-head">
+            <span>LOCAL LLM</span>
+            <span id="l0State">standby</span>
+          </div>
+          <div class="l0-meta" id="l0Model">127.0.0.1 · unloaded</div>
+        </div>
+      </div>
+
+      <!-- Right Column: Main Execution Flow -->
+      <div class="flow-col">
+        <div class="node node-main" id="mainNode">
+          <div class="node-row">
+            <span class="box-title" style="color:var(--orange)" id="mainModel">Agent · main</span>
+            <span style="font-size:8.5px;color:var(--orange)" id="mainStatus">[ready]</span>
+          </div>
+          <div class="main-sub">
+            <span>tool: <b style="color:var(--text)" id="mainLastTool">-</b></span>
+            <span>total <b style="color:var(--text)" id="mainTokens">0k</b></span>
+          </div>
+        </div>
+
+        <!-- Connector: Main <-> MCP Router -->
+        <svg class="connector-svg" viewBox="0 0 260 20" height="20">
+          <defs>
+            <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+              <feGaussianBlur stdDeviation="2.2" result="blur" />
+              <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+          </defs>
+          <path d="M 130 0 L 130 18" stroke="#3c4c63" stroke-width="1.2" fill="none" />
+          <polygon points="126,14 134,14 130,20" fill="#3c4c63" />
+          <circle class="packet" id="pktMcp" r="3" fill="#3dd68c" filter="url(#glow)">
+            <animateMotion dur="0.85s" repeatCount="indefinite" path="M 130 0 L 130 18" />
+          </circle>
+        </svg>
+
+        <!-- MCP / Routing Layer (Auto-switches between Generic MCP & JEV) -->
+        <div class="node node-mcp" id="mcpNode">
+          <div class="node-row">
+            <span class="box-title" style="color:var(--green)" id="mcpTitle">MCP · tool router</span>
+            <span style="font-size:9px;color:var(--text)">calls <b id="mcpCalls">0</b></span>
+          </div>
+          <div class="mcp-meters">
+            <div class="meter-row">
+              <span class="meter-label" id="mLbl0">mcp-1</span>
+              <div class="meter-track"><div class="meter-fill idle" id="mFill0"></div></div>
+              <span class="meter-val idle" id="mVal0">-- idle</span>
+            </div>
+            <div class="meter-row">
+              <span class="meter-label" id="mLbl1">mcp-2</span>
+              <div class="meter-track"><div class="meter-fill idle" id="mFill1"></div></div>
+              <span class="meter-val idle" id="mVal1">-- idle</span>
+            </div>
+            <div class="meter-row">
+              <span class="meter-label" id="mLbl2">mcp-3</span>
+              <div class="meter-track"><div class="meter-fill idle" id="mFill2"></div></div>
+              <span class="meter-val idle" id="mVal2">-- idle</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Fan-out SVG -->
+        <svg class="connector-svg" viewBox="0 0 260 26" height="26">
+          <text id="fanoutLabel" x="130" y="9" text-anchor="middle" fill="#6e7f96" font-size="8.5" font-family="monospace">parallel tool execution</text>
+          <path d="M 130 12 L 130 17 M 43 17 L 217 17 M 43 17 L 43 24 M 130 17 L 130 24 M 217 17 L 217 24" stroke="#3c4c63" stroke-width="1.2" fill="none" />
+          <polygon points="40,21 46,21 43,26" fill="#3c4c63" />
+          <polygon points="127,21 133,21 130,26" fill="#3c4c63" />
+          <polygon points="214,21 220,21 217,26" fill="#3c4c63" />
+          <circle class="packet" id="pktSub0" r="2.8" fill="#58a6ff" filter="url(#glow)">
+            <animateMotion dur="1.0s" repeatCount="indefinite" path="M 130 12 L 130 17 L 43 17 L 43 24" />
+          </circle>
+          <circle class="packet" id="pktSub1" r="2.8" fill="#58a6ff" filter="url(#glow)">
+            <animateMotion dur="0.85s" repeatCount="indefinite" path="M 130 12 L 130 24" />
+          </circle>
+          <circle class="packet" id="pktSub2" r="2.8" fill="#58a6ff" filter="url(#glow)">
+            <animateMotion dur="1.0s" repeatCount="indefinite" path="M 130 12 L 130 17 L 217 17 L 217 24" />
+          </circle>
+        </svg>
+
+        <div class="swarm-grid" id="swarmGrid"></div>
+
+        <!-- Fan-in SVG -->
+        <svg class="connector-svg" viewBox="0 0 260 20" height="20">
+          <path d="M 43 0 L 43 9 L 217 9 L 217 0 M 130 0 L 130 18" stroke="#3c4c63" stroke-width="1.2" fill="none" />
+          <polygon points="127,14 133,14 130,20" fill="#3c4c63" />
+          <circle class="packet" id="pktReturn" r="2.8" fill="#f28b50" filter="url(#glow)">
+            <animateMotion dur="0.9s" repeatCount="indefinite" path="M 43 0 L 43 9 L 130 9 L 130 18" />
+          </circle>
+        </svg>
+
+        <div class="node node-main node-return">
+          <div class="box-title" style="color:var(--orange)">back to main agent · lead</div>
+          <div class="box-sub">synthesize + verify</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="timeline-panel">
+      <div class="timeline-head">
+        <span>activity timeline (last 28 steps)</span>
+        <span>main · swarm · mcp · advisor</span>
+      </div>
+      <div class="timeline-bars" id="timelineBars"></div>
+    </div>
+
+    <div class="log-panel">
+      <div class="log-header">
+        <span>session log</span>
+        <span id="logSteps">0 steps</span>
+      </div>
+      <div class="log-list" id="logList"></div>
+    </div>
+
+    <div class="footer">
+      <div class="prompt-line">
+        <span class="prompt-path">~/antigravity $</span>
+        <span id="cliCmd">agy-flow-monitor --live</span>
+        <span class="cursor"></span>
+      </div>
+      <div class="statusbar">
+        <div class="sb-left">
+          <span>local <span class="badge-cyan" id="sbLocal">[standby]</span></span>
+          <span>mcp <span class="badge-green" id="sbMcp">[0]</span></span>
+          <span>swarm <span class="badge-blue" id="sbSwarm">[0/0]</span></span>
+          <span>audit <span class="badge-purple" id="sbAdvisor">[on call]</span></span>
+        </div>
+        <span class="sync-status" id="syncStatus">sync: connecting...</span>
+      </div>
+    </div>
+  </div>
+
+  <!--__BUNDLE_SCRIPT__-->
+</body>
+</html>

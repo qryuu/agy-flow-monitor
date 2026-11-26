@@ -1,0 +1,19 @@
+{
+  "name": "agy-flow-monitor",
+  "version": "1.0.0",
+  "description": "Zero-dependency real-time flow & telemetry side-pane MCP App for Google Antigravity",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/ext-apps": "latest",
+    "@modelcontextprotocol/sdk": "latest",
+    "esbuild": "^0.25.0",
+    "zod": "^4.2.0"
+  }
+}
